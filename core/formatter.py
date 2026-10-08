@@ -120,6 +120,34 @@ class MessageFormatter:
         return "\n".join(lines)
 
     @staticmethod
+    def format_new_entries(entries: list, rank_type: str, previous_at=None) -> str:
+        """格式化「新上榜」高亮
+
+        Args:
+            entries: [(名次, comic), ...]，来自 RankHistoryStore.update()
+            rank_type: 榜单类型
+            previous_at: 上次榜单的保存时间戳（用于说明对比基准）
+        """
+        if not entries:
+            return "🆕 本次榜单没有新上榜作品"
+        name = RANK_TYPES.get(rank_type, rank_type)
+        lines = [f"🆕 新上榜 · {name}", "━━━━━━━━━━━━━━━━━━━"]
+        for rank, comic in entries:
+            title = comic.get("title", "未知")
+            if len(title) > 35:
+                title = title[:35] + "..."
+            lines.append(
+                f"🆕 #{rank} {title} (ID: {comic.get('_id', 'N/A')}) "
+                f"| ❤️ {comic.get('totalLikes', 0)}"
+            )
+        lines.append("━━━━━━━━━━━━━━━━━━━")
+        if previous_at:
+            lines.append(
+                f"💡 与上次榜单（{MessageFormatter.ts_str(previous_at)}）相比"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
     def format_favourites(comics: list, page: int = 1) -> str:
         """格式化我的收藏"""
         if not comics:
@@ -176,6 +204,7 @@ class MessageFormatter:
             "/picadl <ID> - 整本下载(后台，完成后通知)\n"
             "/picadl <ID> <章节号> - 下载单章节\n"
             "/picarank [H24|D7|D30] - 排行榜\n"
+            "/picasub [H24|D7|D30] - 订阅排行榜定时推送(list/off)\n"
             "/picacomics <分区> [页码] - 浏览分区\n"
             "/picafav <ID> - 收藏/取消收藏\n"
             "/picamyfav [页码] - 我的收藏\n"

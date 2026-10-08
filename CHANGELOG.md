@@ -1,5 +1,73 @@
 # 更新日志
 
+## v1.4.3
+
+### 新功能 1：排行榜「新上榜」提示（默认开启）
+
+每次发送排行榜后按榜单类型保存快照，下次发送时对比并额外提示新上榜作品。
+
+- 快照保存在持久化目录 `rank_history/{H24,D7,D30}.json`
+  （`data/plugin_data/astrbot_plugin_pica/` 下，不受 `/picaclean` 影响），
+  写入采用「先写临时文件再替换」的原子方式
+- 对比结果以「🆕 新上榜」消息发出，含名次、标题、ID 与爱心数，
+  并注明与哪一次榜单相比
+- 快照按榜单类型独立；只在 `page_size` 以内（用户看得见）高亮，
+  但**全量**榜单都进快照，避免调整 `page_size` 后误报
+- 榜单接口返回空结果时**不**更新快照，避免把整榜误判成新上榜
+- 新增配置项 `rank_new_highlight`（默认 `true`）：关闭后不再提示，
+  快照仍会保存（保留对比基准）
+- 首次使用没有对比基准，因此第一次不会有「新上榜」消息
+- 新增 `core/rank_history.py`、`RankDiff` 与 `MessageFormatter.format_new_entries()`
+
+### 新功能 2：`/picasub` 排行榜定时推送订阅
+
+- `/picasub [H24|D7|D30]` 为当前群添加订阅（缺省日榜），
+  `/picasub list` 查看本群订阅，`/picasub off` 取消本群全部订阅
+- 各榜单的刷新时间用 **5 字段 cron**（分 时 日 月 星期）配置：
+  - `rank_cron_h24`（默认 `0 9 * * *`，每天 09:00）
+  - `rank_cron_d7`（默认 `0 9 * * 1`，每周一 09:00）
+  - `rank_cron_d30`（默认 `0 9 1 * *`，每月 1 日 09:00）
+  - 留空表示该榜单不推送
+- 自实现 cron 匹配（`core/cron.py`）：支持 `*`、`a`、`a-b`、`a,b,c`、
+  `*/n`、`a-b/n`；0 与 7 都表示周日；日与星期同时限定时需同时满足；
+  **不新增第三方依赖**
+- 后台每 30 秒检查一次，同一分钟只触发一次；只推给订阅了该榜单类型的会话，
+  榜单只抓一次
+- 推送内容与 `/picarank` 一致（榜单 + 新上榜 + 可选封面 PDF），
+  与手动命令**共用同一份快照**，不会互相重复报新上榜
+- 推送账号优先用订阅者（执行 `/picasub` 的人）绑定的哔咔账号，
+  其次回落到配置的默认账号（新增 `PicaAuthManager.ensure_default_login()`）；
+  两者都不可用时跳过并记日志，不影响其他会话
+- 订阅关系保存在 `rank_subscriptions.json`
+- **主动推送的文本发送**：主动推送不经过 AstrBot 响应管线，因此插件按会话的
+  `platform_settings.forward_threshold`（与管线同源）自行处理长文本 —— 超过阈值时
+  先取机器人自身账号（`bot.get_login_info()`，按平台缓存），再折叠成 QQ 的
+  「合并转发」`Node` 发送；折叠后的 payload 与管线自身产出**逐字节一致**，
+  短文本行为完全不变，取不到账号时退化为普通文本并记 warning
+- 折叠消息发送失败记 warning（此时用户什么都收不到）；普通文本失败仍是 debug 级
+- 新增 `core/subscriptions.py`
+
+### 新功能 3：调试命令 `/picadebug`
+
+- `/picadebug [H24|D7|D30|all]` 无视 `rank_cron_*` 的时间设置，
+  立即触发一次订阅推送（不带参数=全部榜单），用于验证推送链路
+- **权限**：只允许配置里 `admin_ids` 中的用户使用；未配置 `admin_ids` 时
+  直接拒绝并提示 —— 该命令等于一次全量广播，不能对群成员开放
+- 不消耗定时推送的「同一分钟只触发一次」标记，定时任务照常触发；
+  但会写入榜单快照，因此随后的定时推送不会重复提醒新上榜
+- 回复里按榜单类型给出结果（已推送给 N 个会话 / 无人订阅 / 推送失败）
+- 抽出的 `_admin_ids()` 同时用于 `admin_only` 与调试命令的权限判断
+
+### 其他
+
+- `/picarank` 内部重构：榜单抓取与对比抽到 `_rank_payload()`，
+  手动命令与定时推送共用 `_rank_texts()`，避免两处文案漂移
+- 后台任务启动统一走 `_spawn_task()`；插件卸载时同时取消定时推送任务
+- README 补充「新上榜提示」「定时推送」「长文本折叠」三节
+- 新增 124 个测试用例：`test_cron.py` / `test_rank_history.py` /
+  `test_subscriptions.py` / `test_rank_new_highlight.py` / `test_rank_subscribe.py` /
+  `test_rank_debug.py` / `test_notify_forward.py`（全套 178 个用例、ruff 均通过）
+
 ## v1.4.2
 
 ### 新功能：`/picarank` 可附带排行榜封面 PDF（默认关闭）

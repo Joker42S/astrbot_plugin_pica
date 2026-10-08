@@ -83,6 +83,8 @@ for _name in (
     "Reply",
     "Face",
     "Json",
+    "Node",
+    "Nodes",
 ):
     setattr(mc, _name, type(_name, (_Component,), {}))
 

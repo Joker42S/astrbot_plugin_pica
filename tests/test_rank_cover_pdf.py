@@ -18,6 +18,8 @@ from PIL import Image
 from conftest import import_plugin_main
 from core.downloader import PicaDownloader
 from core.packer import _collect_images_sorted
+from core.rank_history import RankHistoryStore
+from core.subscriptions import RankSubscriptionStore
 
 main = import_plugin_main()
 PicaPlugin = main.PicaPlugin
@@ -152,6 +154,8 @@ def _make_plugin(tmp_path, config=None, comics: list = None, fail_ids=()):
     plugin.auth = _FakeAuth()
     plugin.client = _FakeClient(comics, fail_ids)
     plugin.downloader = PicaDownloader(plugin.client, tmp_path)
+    plugin.rank_history = RankHistoryStore(tmp_path)
+    plugin.subs = RankSubscriptionStore(tmp_path)
     return plugin
 
 

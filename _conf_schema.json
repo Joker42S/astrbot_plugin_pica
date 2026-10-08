@@ -65,10 +65,34 @@
     "hint": "开启后 /picarank 会额外下载排行榜上全部漫画的封面，按榜单顺序打包成一个 PDF 一并发送；需要 pymupdf，封面张数等于 page_size，封面较多时发送耗时较长",
     "default": false
   },
+  "rank_new_highlight": {
+    "type": "bool",
+    "description": "排行榜新上榜提示",
+    "hint": "每次发送排行榜时提示新上榜作品",
+    "default": true
+  },
+  "rank_cron_h24": {
+    "type": "string",
+    "description": "日榜定时推送时间(cron)",
+    "hint": "5 字段 cron：分 时 日 月 星期，如 0 9 * * * 表示每天 09:00；留空表示不推送。仅对已用 /picasub 订阅的会话生效",
+    "default": "0 9 * * *"
+  },
+  "rank_cron_d7": {
+    "type": "string",
+    "description": "周榜定时推送时间(cron)",
+    "hint": "5 字段 cron：分 时 日 月 星期，如 0 9 * * 1 表示每周一 09:00（0 和 7 都表示周日）；留空表示不推送",
+    "default": "0 9 * * 1"
+  },
+  "rank_cron_d30": {
+    "type": "string",
+    "description": "月榜定时推送时间(cron)",
+    "hint": "5 字段 cron：分 时 日 月 星期，如 0 9 1 * * 表示每月 1 日 09:00；留空表示不推送",
+    "default": "0 9 1 * *"
+  },
   "modify_md5": {
     "type": "bool",
     "description": "下载时修改图片MD5",
-    "hint": "修改图片字节防止被 pica 风控检测，建议开启",
+    "hint": "修改图片字节防止被 QQ 风控检测，建议开启",
     "default": true
   },
   "pack_format": {

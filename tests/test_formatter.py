@@ -36,6 +36,26 @@ def test_help_text():
     assert "/picalogin" in text
     assert "/picadl" in text
     assert "/picaclean" in text
+    assert "/picasub" in text
+
+
+def test_format_new_entries():
+    comics = [(2, {"_id": "c1", "title": "新本子", "totalLikes": 9})]
+    out = MessageFormatter.format_new_entries(comics, "H24", previous_at=1759900000)
+    assert "新上榜" in out
+    assert "#2" in out and "新本子" in out and "c1" in out
+    assert "与上次榜单" in out
+
+
+def test_format_new_entries_without_baseline_time():
+    comics = [(1, {"_id": "c1", "title": "T"})]
+    out = MessageFormatter.format_new_entries(comics, "D7")
+    assert "新上榜" in out
+    assert "与上次榜单" not in out
+
+
+def test_format_new_entries_empty():
+    assert "没有新上榜" in MessageFormatter.format_new_entries([], "H24")
 
 
 def test_format_categories():

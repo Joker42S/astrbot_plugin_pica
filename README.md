@@ -37,6 +37,10 @@ docker restart astrbot
 | max_concurrent | 章节图片下载并发数（默认 5） |
 | send_cover | 详情是否附带封面图（默认开） |
 | rank_cover_pdf | `/picarank` 是否额外附带排行榜封面 PDF（默认关，见下） |
+| rank_new_highlight | 排行榜「新上榜」提示（默认开，见下） |
+| rank_cron_h24 | 日榜定时推送时间，5 字段 cron（默认 `0 9 * * *`，见下） |
+| rank_cron_d7 | 周榜定时推送时间（默认 `0 9 * * 1`，每周一 09:00） |
+| rank_cron_d30 | 月榜定时推送时间（默认 `0 9 1 * *`，每月 1 日 09:00） |
 | modify_md5 | 下载时修改图片 MD5 防平台风控（默认开） |
 | pack_format | 章节下载打包格式：`images`=直接发前 10 张图 / `zip`=压缩包(可加密) / `pdf`=PDF / `long_img`=纵向长图(过长自动分段打包) / `none`=仅本地保存不发送（默认 `zip`） |
 | pack_password | 打包密码，为 ZIP/PDF 加密，留空不加密（默认空） |
@@ -69,6 +73,45 @@ docker restart astrbot
 - 封面较多 / 网络较慢时命令耗时会变长，过程中会提示「正在下载…」
 - 产物保存在 `packs/`（`排行榜封面_<H24|D7|D30>.pdf`），同名会覆盖
 
+### 排行榜「新上榜」提示（默认开启）
+
+每次发送排行榜后，会把该榜单的快照保存到
+`data/plugin_data/astrbot_plugin_pica/rank_history/{H24,D7,D30}.json`
+（持久化目录，**不**受 `/picaclean` 影响）；下次发送同一榜单时自动对比，
+额外发一条「🆕 新上榜」消息，标出名次与标题：
+
+- 快照按榜单类型独立（日榜/周榜/月榜互不影响）
+- 只有 `page_size` 以内（用户看得见）的名次才会被高亮，
+  但**全量**榜单都会进快照 —— 这样调整 `page_size` 不会误报
+- 榜单接口返回空结果时不更新快照，避免把整榜误判成「新上榜」
+- 配置项 `rank_new_highlight=false` 可关闭提示（快照仍会保存，
+  手动 `/picarank` 与定时推送共用同一份快照，不会互相重复报）
+- 首次使用没有对比基准，因此第一次不会出现「新上榜」消息
+
+### 排行榜定时推送（可选，默认 09:00 推送）
+
+- `/picasub [H24|D7|D30]` 为当前群订阅排行榜推送（缺省日榜）
+- `/picasub list` 查看本群订阅；`/picasub off` 取消本群全部订阅
+- 推送时间用 5 字段 cron（分 时 日 月 星期）配置：
+  - `rank_cron_h24` 默认 `0 9 * * *`（每天 09:00）
+  - `rank_cron_d7` 默认 `0 9 * * 1`（每周一 09:00，0 和 7 都表示周日）
+  - `rank_cron_d30` 默认 `0 9 1 * *`（每月 1 日 09:00）
+  - 支持 `*`、`a`、`a-b`、`a,b,c`、`*/n`、`a-b/n`；日与星期同时限定时需同时满足；
+    **留空表示该榜单不推送**
+- 每 30 秒检查一次，同一分钟只推送一次；只推给订阅了该榜单类型的会话
+- 推送内容与 `/picarank` 一致：榜单文本 + 新上榜高亮（+ 封面 PDF，若开启）
+- 推送账号：优先用订阅者（执行 `/picasub` 的人）自己绑定的哔咔账号，
+  其次回落到配置的默认账号；两者都不可用时本次跳过并记日志
+- 订阅关系保存在 `data/plugin_data/astrbot_plugin_pica/rank_subscriptions.json`
+- **长文本折叠**：主动推送不经过 AstrBot 的响应管线，所以插件自行复刻了管线的
+  这层处理 —— 纯文本超过该会话的 `platform_settings.forward_threshold`
+  （框架默认 1500 字）时，会折叠成 QQ 的「合并转发」再发；阈值取会话自己的
+  平台配置，短文本行为完全不变，取不到机器人账号时会退化成普通文本并记 warning
+- **调试**：`/picadebug [H24|D7|D30|all]` 可无视 `rank_cron_*` 的时间设置，
+  立即触发一次订阅推送（不带参数=全部榜单）。该命令**只允许 `admin_ids`
+  中的用户**使用（未配置 `admin_ids` 时拒绝，避免群成员触发全量广播）；
+  它会写入榜单快照，因此随后的定时推送不会重复提醒新上榜
+
 ## 命令
 
 | 命令 | 说明 |
@@ -82,7 +125,9 @@ docker restart astrbot
 | `/picaeps <ID>` | 章节列表 |
 | `/picadl <ID>` | 整本下载（后台任务，完成后自动通知） |
 | `/picadl <ID> <章节号>` | 下载单章节（按打包格式发送） |
-| `/picarank [H24\|D7\|D30]` | 排行榜（日/周/月），开启 `rank_cover_pdf` 后附带封面 PDF |
+| `/picarank [H24\|D7\|D30]` | 排行榜（日/周/月），附带新上榜提示与可选封面 PDF |
+| `/picasub [H24\|D7\|D30\|list\|off]` | 订阅 / 查看 / 取消本群排行榜定时推送 |
+| `/picadebug [H24\|D7\|D30\|all]` | 调试：无视时间立即触发订阅推送（仅 `admin_ids` 可用） |
 | `/picacomics <分区名> [页码]` | 按分区浏览 |
 | `/picacat` | 全部分区列表 |
 | `/picafav <ID>` | 收藏 / 取消收藏 |
@@ -118,9 +163,12 @@ astrbot_plugin_pica/
 └── core/
     ├── client.py        # Pica API 封装（HMAC-SHA256 签名、登录、搜索、下载）
     ├── auth.py          # token 管理（持久化、JWT 过期自动重登）
-    ├── downloader.py    # 图片下载（并发、MD5 修改）
+    ├── downloader.py    # 图片下载（并发、MD5 修改、批量封面）
     ├── packer.py        # 打包器（ZIP/PDF/长图，可选加密）
     ├── formatter.py     # 消息格式化
+    ├── rank_history.py  # 排行榜快照与「新上榜」对比
+    ├── subscriptions.py # 排行榜定时推送订阅（按会话）
+    ├── cron.py          # cron 表达式匹配（定时推送用）
     └── constants.py     # 签名密钥、分区、排序等常量
 ```
 
