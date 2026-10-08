@@ -59,6 +59,12 @@
     "hint": "查看本子详情时附带封面预览图",
     "default": true
   },
+  "rank_cover_pdf": {
+    "type": "bool",
+    "description": "排行榜附带封面PDF(默认关闭)",
+    "hint": "开启后 /picarank 会额外下载排行榜上全部漫画的封面，按榜单顺序打包成一个 PDF 一并发送；需要 pymupdf，封面张数等于 page_size，封面较多时发送耗时较长",
+    "default": false
+  },
   "modify_md5": {
     "type": "bool",
     "description": "下载时修改图片MD5",

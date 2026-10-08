@@ -8,6 +8,7 @@ Pica-Comics - AstrBot 哔咔漫画插件
 
 import asyncio
 import shutil
+import tempfile
 from pathlib import Path
 
 import astrbot.api.message_components as Comp
@@ -17,6 +18,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 from .core import (
     CATEGORIES,
+    RANK_TYPES,
     MessageFormatter,
     PicaAuthManager,
     PicaClient,
@@ -53,7 +55,7 @@ DEFAULT_API_TIMEOUT_SEC = 900
     "astrbot_plugin_pica",
     "huashuiyue07",
     "哔咔漫画插件 - 搜索、查看、下载哔咔漫画本子，支持整本下载与打包",
-    "1.4.1",
+    "1.5.0",
     "https://github.com/huashuiyue07/astrbot_plugin_pica",
 )
 class PicaPlugin(Star):
@@ -816,8 +818,93 @@ class PicaPlugin(Star):
             page_size = int(self.config.get("page_size", 10))
             comics = comics[:page_size]
             yield event.plain_result(MessageFormatter.format_rank(comics, tt))
+            # 可选功能（默认关闭）：把排行榜全部封面打包成 PDF 一并发送
+            if comics and self.config.get("rank_cover_pdf", False):
+                await self._send_rank_cover_pdf(event, comics, token, tt)
         except PicaError as e:
             yield event.plain_result(f"❌ 获取排行榜失败: {e}")
+
+    async def _notify(self, umo: str, text: str) -> None:
+        """尽力发送一条纯文本提示：失败只记日志，不影响调用方流程"""
+        try:
+            await self.context.send_message(umo, MessageChain([Comp.Plain(text)]))
+        except Exception as e:
+            logger.debug(f"发送提示消息失败: {e}")
+
+    async def _send_rank_cover_pdf(
+        self, event: AstrMessageEvent, comics: list, token: str, tt: str
+    ) -> bool:
+        """下载排行榜全部封面、打包成 PDF 并发送（受 rank_cover_pdf 开关控制）。
+
+        这是排行榜文本之外的附加内容，因此尽力而为：任一步失败只提示用户，
+        不向上抛异常，避免影响排行榜本身。
+
+        Returns:
+            是否确认发送成功。
+        """
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        cover_dir: Path | None = None
+        try:
+            # 每次请求用独立临时目录：并发或重复调用时封面不会互相污染
+            cover_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f"rank_{tt}_", dir=self.downloader.cache_dir()
+                )
+            )
+
+            await self._notify(
+                umo, f"🖼️ 正在下载排行榜 {len(comics)} 张封面并生成 PDF..."
+            )
+            covers = await self.downloader.download_covers(
+                comics,
+                token=token,
+                max_concurrent=int(self.config.get("max_concurrent", 5)),
+                target_dir=cover_dir,
+            )
+            if not covers:
+                await self._notify(umo, "❌ 排行榜封面下载失败，未获取到任何封面")
+                return False
+
+            packer = PicaPacker("pdf")
+            safe_name = self._safe_filename(f"排行榜封面_{tt}")
+            packs_dir = self.data_dir / PACKS_DIR
+            # 打包是 CPU/IO 密集操作，丢到线程池避免阻塞事件循环
+            result = await asyncio.to_thread(
+                packer.pack, cover_dir, safe_name, packs_dir
+            )
+            if not result.success or not result.output_path:
+                await self._notify(umo, f"❌ 封面 PDF 生成失败: {result.error_message}")
+                return False
+
+            out_path = result.output_path
+            rank_name = RANK_TYPES.get(tt, tt)
+            chain = MessageChain(
+                [
+                    Comp.File(name=out_path.name, file=str(out_path)),
+                    Comp.Plain(f"🖼️ 排行榜封面 {len(covers)} 张 ({rank_name})"),
+                ]
+            )
+            send_result = await self._send_with_retry(event, umo, chain)
+            if send_result is True:
+                return True
+            if send_result is None:
+                # 上传超时：文件很可能已送达，不再重发，也不谎报失败
+                await self._notify(
+                    umo,
+                    f"⚠️ 封面 PDF 上传超时，无法确认是否已送达，请先确认是否收到；"
+                    f"本地文件: {out_path}",
+                )
+                return False
+            await self._notify(umo, f"⚠️ 封面 PDF 发送失败，已保存在本地: {out_path}")
+            return False
+        except Exception as e:
+            logger.error(f"排行榜封面 PDF 处理异常: {e}")
+            await self._notify(umo, f"⚠️ 排行榜封面 PDF 处理失败: {e}")
+            return False
+        finally:
+            # 封面只是 PDF 的中间产物，打包完即可清理
+            if cover_dir is not None:
+                shutil.rmtree(cover_dir, ignore_errors=True)
 
     # ---------- 分区浏览 ----------
 

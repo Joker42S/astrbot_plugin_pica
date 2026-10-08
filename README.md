@@ -36,6 +36,7 @@ docker restart astrbot
 | page_size | 列表每页显示数量（默认 10） |
 | max_concurrent | 章节图片下载并发数（默认 5） |
 | send_cover | 详情是否附带封面图（默认开） |
+| rank_cover_pdf | `/picarank` 是否额外附带排行榜封面 PDF（默认关，见下） |
 | modify_md5 | 下载时修改图片 MD5 防平台风控（默认开） |
 | pack_format | 章节下载打包格式：`images`=直接发前 10 张图 / `zip`=压缩包(可加密) / `pdf`=PDF / `long_img`=纵向长图(过长自动分段打包) / `none`=仅本地保存不发送（默认 `zip`） |
 | pack_password | 打包密码，为 ZIP/PDF 加密，留空不加密（默认空） |
@@ -53,6 +54,21 @@ docker restart astrbot
   天的缓存；总大小超过 `cache_max_size_mb` 时按最旧优先删除（下载缓存 + 打包产物）
 - **手动清理**：`/picaclean` 清空全部；`/picaclean <天数>` 只清理 N 天前的缓存
 
+### 排行榜封面 PDF（可选，默认关闭）
+
+开启 `rank_cover_pdf` 后，`/picarank` 会在排行榜文本之外，额外下载榜单上**全部**
+漫画（数量等于 `page_size`）的封面，按榜单顺序打包成一个 PDF 一并发送：
+
+- 默认关闭：不开启时行为与旧版完全一致，只发送排行榜文本
+- 页序与榜单一致：第 1 名在第 1 页
+- 单张封面下载失败只跳过该张，不影响其余封面和排行榜文本
+- 需要 `pymupdf`（`requirements.txt` 已包含），缺失时会提示「封面 PDF 生成失败」
+- 封面 PDF **不加密**（与 `pack_password` 无关），仅作榜单预览
+- 该 PDF 属上传类消息：上传超时不会重发（沿用 v1.4.1 的防重复发送语义）
+- 封面下载与打包全程尽力而为，任何意外只提示用户，不会让排行榜命令失败
+- 封面较多 / 网络较慢时命令耗时会变长，过程中会提示「正在下载…」
+- 产物保存在 `packs/`（`排行榜封面_<H24|D7|D30>.pdf`），同名会覆盖
+
 ## 命令
 
 | 命令 | 说明 |
@@ -66,7 +82,7 @@ docker restart astrbot
 | `/picaeps <ID>` | 章节列表 |
 | `/picadl <ID>` | 整本下载（后台任务，完成后自动通知） |
 | `/picadl <ID> <章节号>` | 下载单章节（按打包格式发送） |
-| `/picarank [H24\|D7\|D30]` | 排行榜（日/周/月） |
+| `/picarank [H24\|D7\|D30]` | 排行榜（日/周/月），开启 `rank_cover_pdf` 后附带封面 PDF |
 | `/picacomics <分区名> [页码]` | 按分区浏览 |
 | `/picacat` | 全部分区列表 |
 | `/picafav <ID>` | 收藏 / 取消收藏 |
