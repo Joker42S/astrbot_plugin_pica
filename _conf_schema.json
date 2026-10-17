@@ -77,6 +77,12 @@
     "hint": "仅作用于 /picasub 定时推送，不影响 /picarank 手动查看的条数；0 表示与 page_size 相同。条数较多（>约25条）时推送会自动折叠成合并转发",
     "default": 0
   },
+  "sub_admin_only": {
+    "type": "bool",
+    "description": "仅管理员可添加/取消排行榜订阅",
+    "hint": "开启后只有 admin_ids 中的用户能订阅或取消定时推送（/picasub list 所有人可用）。定时推送会把内容主动发到群里，建议保持开启；未配置 admin_ids 时订阅会被拒绝",
+    "default": true
+  },
   "rank_cron_h24": {
     "type": "string",
     "description": "日榜定时推送时间(cron)",

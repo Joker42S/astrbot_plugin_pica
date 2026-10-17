@@ -1,5 +1,21 @@
 # 更新日志
 
+## v1.4.5
+
+### 安全：订阅写操作默认仅管理员可用（`sub_admin_only`）
+
+之前任何群成员都能用 `/picasub` 把榜单订阅成每日定时推送——等于给了所有人群发开关。
+
+- 新增配置 `sub_admin_only`（默认 `true`）：只有 `admin_ids` 中的用户能添加 / 取消订阅
+- `/picasub list` 保持所有人可用（只读，无副作用）
+- 未配置 `admin_ids` 时给出明确提示，而不是静默放行；需要开放给群员时设为 `false` 即可恢复旧行为
+- 已有订阅不受影响（只收紧写操作）
+
+### 其他
+
+- 订阅状态文本新增「推送 N 条」，解释 `page_size` 与 `rank_push_size` 的差异
+- 新增 `tests/test_sub_permissions.py`（8 条用例）
+
 ## v1.4.4
 
 ### 新配置项 `rank_push_size`：推送条数与命令条数解耦

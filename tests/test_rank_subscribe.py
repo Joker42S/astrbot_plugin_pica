@@ -166,7 +166,8 @@ def _make_plugin(
     tmp_path, config=None, boards=None, bound=None, default=None, fail=False
 ):
     plugin = PicaPlugin.__new__(PicaPlugin)
-    plugin.config = config if config is not None else {}
+    # 本文件只测订阅语义；权限门槛见 test_sub_permissions.py
+    plugin.config = {"sub_admin_only": False, **(config or {})}
     plugin.context = _FakeContext()
     plugin.data_dir = tmp_path
     plugin.auth = _FakeAuth(bound, default)

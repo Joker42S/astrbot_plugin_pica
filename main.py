@@ -70,7 +70,7 @@ RANK_SUB_TICK_SEC = 30
     "astrbot_plugin_pica",
     "huashuiyue07",
     "哔咔漫画插件 - 搜索、查看、下载哔咔漫画本子，支持整本下载与打包",
-    "1.4.4",
+    "1.4.5",
     "https://github.com/huashuiyue07/astrbot_plugin_pica",
 )
 class PicaPlugin(Star):
@@ -1141,10 +1141,30 @@ class PicaPlugin(Star):
                 schedule = f"⚠️ 刷新时间非法: {expr}"
             else:
                 schedule = f"⏰ {expr}"
-            lines.append(f"✅ {name} {schedule}")
+            lines.append(f"✅ {name} {schedule} · 推送 {self._push_size()} 条")
         lines.append("━━━━━━━━━━━━━━━━━━━")
         lines.append("💡 /picasub <H24|D7|D30> 添加 | /picasub off 取消全部")
         return "\n".join(lines)
+
+    def _sub_guard(self, event: AstrMessageEvent) -> str | None:
+        """订阅写操作（添加/取消）的权限检查。
+
+        默认 `sub_admin_only=True`：只有 `admin_ids` 里的用户能改订阅。
+        定时推送会把榜单主动发到群里，若任何群成员都能订阅，等于给了一个
+        「让机器人每天往群里推内容」的开关，因此写操作默认收紧；
+        `/picasub list` 是只读的，不受此限制。
+        """
+        if not self.config.get("sub_admin_only", True):
+            return None
+        admin_ids = self._admin_ids()
+        if not admin_ids:
+            return (
+                "❌ 已开启「仅管理员可订阅」，但未配置 admin_ids；"
+                "请填写管理员 QQ，或把 sub_admin_only 设为 false"
+            )
+        if self._uid(event) not in admin_ids:
+            return "❌ 只有管理员可以添加/取消排行榜订阅"
+        return None
 
     @filter.command("picasub")
     async def subscribe_command(self, event: AstrMessageEvent, arg: str = None):
@@ -1159,6 +1179,11 @@ class PicaPlugin(Star):
 
         if keyword in ("list", "ls", "status"):
             yield event.plain_result(self._sub_status_text(umo))
+            return
+
+        denied = self._sub_guard(event)
+        if denied:
+            yield event.plain_result(denied)
             return
 
         if keyword in ("off", "del", "unsub"):
