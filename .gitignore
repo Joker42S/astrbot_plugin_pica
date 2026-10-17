@@ -24,3 +24,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# 本地测试临时目录
+.tmp/

@@ -70,7 +70,7 @@ RANK_SUB_TICK_SEC = 30
     "astrbot_plugin_pica",
     "huashuiyue07",
     "哔咔漫画插件 - 搜索、查看、下载哔咔漫画本子，支持整本下载与打包",
-    "1.4.3",
+    "1.4.4",
     "https://github.com/huashuiyue07/astrbot_plugin_pica",
 )
 class PicaPlugin(Star):
@@ -859,20 +859,34 @@ class PicaPlugin(Star):
         except (TypeError, ValueError):
             return 10
 
-    async def _rank_payload(self, tt: str, token: str) -> tuple[list[dict], RankDiff]:
+    def _push_size(self) -> int:
+        """定时推送的榜单条数；rank_push_size 为 0/非法时跟随 page_size"""
+        try:
+            size = int(self.config.get("rank_push_size", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0
+        return size if size > 0 else self._page_size()
+
+    async def _rank_payload(
+        self, tt: str, token: str, limit: int | None = None
+    ) -> tuple[list[dict], RankDiff]:
         """拉取全量榜单并与上次快照对比。
 
+        Args:
+            limit: 展示条数；None 或非正数时用 page_size。
+                定时推送传 rank_push_size，使「推送条数」与「命令条数」解耦。
+
         Returns:
-            (按 page_size 截断的展示用榜单, 与上次快照的差异)
+            (按 limit 截断的展示用榜单, 与上次快照的差异)
         """
         all_comics = list(await self.client.leaderboard(tt, token) or [])
         if not all_comics:
             # 空结果可能只是接口抖动：不更新快照，
             # 否则下次会把整榜都当成「新上榜」
             return [], RankDiff()
-        page_size = self._page_size()
-        diff = self.rank_history.update(tt, all_comics, limit=page_size)
-        return all_comics[:page_size], diff
+        size = limit if limit is not None and limit > 0 else self._page_size()
+        diff = self.rank_history.update(tt, all_comics, limit=size)
+        return all_comics[:size], diff
 
     def _rank_texts(self, tt: str, comics: list, diff: RankDiff) -> list[str]:
         """本次要发送的榜单文本：榜单列表 [+ 新上榜高亮]"""
@@ -1297,7 +1311,9 @@ class PicaPlugin(Star):
         token, user_id = identity
         self.client.set_current_user(user_id)
         try:
-            comics, diff = await self._rank_payload(tt, token)
+            comics, diff = await self._rank_payload(
+                tt, token, limit=self._push_size()
+            )
         except Exception as e:
             logger.warning(f"定时推送 {tt} 排行榜失败: {e}")
             return 0

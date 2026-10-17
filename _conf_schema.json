@@ -71,6 +71,12 @@
     "hint": "每次发送排行榜时提示新上榜作品",
     "default": true
   },
+  "rank_push_size": {
+    "type": "int",
+    "description": "定时推送条数(0=跟随 page_size)",
+    "hint": "仅作用于 /picasub 定时推送，不影响 /picarank 手动查看的条数；0 表示与 page_size 相同。条数较多（>约25条）时推送会自动折叠成合并转发",
+    "default": 0
+  },
   "rank_cron_h24": {
     "type": "string",
     "description": "日榜定时推送时间(cron)",
