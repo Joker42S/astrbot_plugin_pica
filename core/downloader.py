@@ -9,6 +9,7 @@ pica 的图片资源（封面、章节图）需要带 authorization 请求头才
 import asyncio
 import random
 import re
+import shutil
 from pathlib import Path
 
 from astrbot.api import logger
@@ -87,6 +88,54 @@ class PicaDownloader:
         except Exception as e:
             logger.debug(f"封面下载失败: {e}")
             return None
+
+    async def download_covers(
+        self,
+        comics: list[dict],
+        token: str = None,
+        max_concurrent: int = 5,
+        target_dir: Path = None,
+    ) -> list[Path]:
+        """按列表顺序批量下载封面，返回本地文件列表（顺序与传入一致）。
+
+        文件名带三位序号前缀（``001_标题.jpg``），使打包器按自然顺序收集图片时
+        得到与排行榜相同的顺序。单张失败只跳过该张，不影响其余封面。
+
+        Args:
+            comics: 漫画列表（需含 thumb/_id/title）
+            target_dir: 输出目录，缺省用缓存目录下的 covers/
+        """
+        if target_dir is None:
+            target_dir = self.cache_dir() / "covers"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        sem = asyncio.Semaphore(max(1, max_concurrent))
+
+        async def fetch(index: int, comic: dict) -> Path | None:
+            async with sem:
+                src = await self.download_cover(comic, token)
+                if src is None or not src.exists():
+                    return None
+                title = _safe_name(str(comic.get("title") or comic.get("_id") or ""))
+                dst = target_dir / f"{index:03d}_{title}{src.suffix or '.jpg'}"
+                try:
+                    await asyncio.to_thread(shutil.copyfile, src, dst)
+                except OSError as e:
+                    logger.warning(f"封面 {index} 写入失败: {e}")
+                    return None
+                return dst
+
+        results = await asyncio.gather(
+            *(fetch(i, comic) for i, comic in enumerate(comics, 1)),
+            return_exceptions=True,
+        )
+        saved: list[Path] = []
+        for index, res in enumerate(results, 1):
+            if isinstance(res, BaseException):
+                logger.warning(f"封面 {index} 下载失败: {res}")
+                continue
+            if res is not None:
+                saved.append(res)
+        return saved
 
     async def download_episode(
         self,

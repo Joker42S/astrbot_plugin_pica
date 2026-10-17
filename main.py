@@ -8,6 +8,8 @@ Pica-Comics - AstrBot 哔咔漫画插件
 
 import asyncio
 import shutil
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import astrbot.api.message_components as Comp
@@ -17,12 +19,18 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 from .core import (
     CATEGORIES,
+    RANK_TYPES,
     MessageFormatter,
     PicaAuthManager,
     PicaClient,
     PicaDownloader,
     PicaError,
     PicaPacker,
+    RankDiff,
+    RankHistoryStore,
+    RankSubscriptionStore,
+    cron_matches,
+    validate_cron,
 )
 
 PLUGIN_NAME = "astrbot_plugin_pica"
@@ -48,12 +56,21 @@ UPLOAD_COMPONENT_TYPES: tuple[type, ...] = (
 # 大文件上传很容易超过 180s 从而触发上面的「假失败」。0 表示不改动。
 DEFAULT_API_TIMEOUT_SEC = 900
 
+# 主动推送纯文本时，超过该字数就折叠成 QQ 的「合并转发」Node。
+# 与 AstrBot 响应管线的 platform_settings.forward_threshold 语义一致，
+# 读不到会话配置时用它兜底。
+DEFAULT_FORWARD_THRESHOLD = 1500
+
+# 排行榜定时推送的检查间隔（秒）。cron 精度为分钟，取 30s 保证不跳过整点那一分钟，
+# 同一分钟内重复命中由 main 里的触发记录去重。
+RANK_SUB_TICK_SEC = 30
+
 
 @register(
     "astrbot_plugin_pica",
     "huashuiyue07",
     "哔咔漫画插件 - 搜索、查看、下载哔咔漫画本子，支持整本下载与打包",
-    "1.4.1",
+    "1.4.3",
     "https://github.com/huashuiyue07/astrbot_plugin_pica",
 )
 class PicaPlugin(Star):
@@ -101,26 +118,49 @@ class PicaPlugin(Star):
         # 进行中的整本下载任务: (user_id, comic_id) -> task
         self._all_download_tasks: dict[tuple[str, str], asyncio.Task] = {}
 
+        # 排行榜快照（用于「新上榜」对比）与定时推送订阅
+        self.rank_history = RankHistoryStore(self.data_dir)
+        self.subs = RankSubscriptionStore(self.data_dir)
+        # 同一分钟内已触发过的榜单类型: tt -> "YYYY-MM-DD HH:MM"
+        self._rank_fired: dict[str, str] = {}
+        # 已告警过的非法 cron 表达式: tt -> expr（避免每 30 秒刷一次日志）
+        self._cron_warned: dict[str, str] = {}
+        # 各平台的机器人自身账号: platform_id -> (QQ 号, 昵称)，合并转发节点需要
+        self._bot_accounts: dict[str, tuple[str, str]] = {}
+
         # 后台缓存自动清理任务
         self._clean_task = None
         clean_interval = int(config.get("cache_clean_interval_hours", 12) or 0)
         if clean_interval > 0:
-            try:
-                self._clean_task = asyncio.create_task(self._cache_clean_loop())
-            except RuntimeError:
-                logger.warning("无法启动缓存清理后台任务：当前没有运行中的事件循环")
+            self._clean_task = self._spawn_task(self._cache_clean_loop, "缓存清理")
+
+        # 排行榜定时推送任务（没有订阅时只是空转，开销可忽略）
+        self._sub_task = self._spawn_task(self._rank_sub_loop, "排行榜订阅推送")
 
         logger.info("Pica-Comics 插件初始化完成")
 
+    @staticmethod
+    def _spawn_task(coro_factory, label: str):
+        """启动后台任务；没有运行中的事件循环时记日志并返回 None"""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(f"无法启动{label}后台任务：当前没有运行中的事件循环")
+            return None
+        return asyncio.create_task(coro_factory())
+
     async def terminate(self) -> None:
         """插件卸载/重载时取消后台任务并释放连接"""
-        task = getattr(self, "_clean_task", None)
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for task in (
+            getattr(self, "_clean_task", None),
+            getattr(self, "_sub_task", None),
+        ):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         try:
             await self.client.aclose()
         except Exception as e:
@@ -175,15 +215,23 @@ class PicaPlugin(Star):
         name = re.sub(r'[\\/:*?"<>|\r\n\t]', "-", name).strip()
         return name[:max_len] or "pica"
 
+    def _admin_ids(self) -> list[str]:
+        """配置里的管理员 ID 列表（逗号分隔）"""
+        return [
+            item.strip()
+            for item in str(self.config.get("admin_ids", "")).split(",")
+            if item.strip()
+        ]
+
     def _check_permission(self, event: AstrMessageEvent) -> tuple[bool, str]:
         """检查权限：管理员白名单（可选，所有命令统一执行）"""
         if not self.config.get("admin_only", False):
             return True, ""
-        admin_ids = str(self.config.get("admin_ids", "")).strip()
+        admin_ids = self._admin_ids()
         if not admin_ids:
             return False, "❌ 已开启仅管理员模式，但未配置 admin_ids"
         user_id = str(event.get_sender_id())
-        if user_id in [a.strip() for a in admin_ids.split(",") if a.strip()]:
+        if user_id in admin_ids:
             return True, ""
         return False, "❌ 你没有权限使用此插件"
 
@@ -799,6 +847,56 @@ class PicaPlugin(Star):
 
     # ---------- 排行榜 ----------
 
+    @staticmethod
+    def _parse_tt(value) -> str | None:
+        """把用户输入解析成榜单类型（H24/D7/D30），非法返回 None"""
+        tt = str(value or "").strip().upper()
+        return tt if tt in RANK_TYPES else None
+
+    def _page_size(self) -> int:
+        try:
+            return max(1, int(self.config.get("page_size", 10) or 10))
+        except (TypeError, ValueError):
+            return 10
+
+    async def _rank_payload(self, tt: str, token: str) -> tuple[list[dict], RankDiff]:
+        """拉取全量榜单并与上次快照对比。
+
+        Returns:
+            (按 page_size 截断的展示用榜单, 与上次快照的差异)
+        """
+        all_comics = list(await self.client.leaderboard(tt, token) or [])
+        if not all_comics:
+            # 空结果可能只是接口抖动：不更新快照，
+            # 否则下次会把整榜都当成「新上榜」
+            return [], RankDiff()
+        page_size = self._page_size()
+        diff = self.rank_history.update(tt, all_comics, limit=page_size)
+        return all_comics[:page_size], diff
+
+    def _rank_texts(self, tt: str, comics: list, diff: RankDiff) -> list[str]:
+        """本次要发送的榜单文本：榜单列表 [+ 新上榜高亮]"""
+        texts = [MessageFormatter.format_rank(comics, tt)]
+        if diff.new_entries and bool(self.config.get("rank_new_highlight", True)):
+            texts.append(
+                MessageFormatter.format_new_entries(
+                    diff.new_entries, tt, diff.previous_updated_at
+                )
+            )
+        return texts
+
+    async def _maybe_send_rank_cover_pdf(
+        self,
+        umo: str,
+        comics: list,
+        token: str,
+        tt: str,
+        event: AstrMessageEvent | None = None,
+    ) -> None:
+        """按配置决定是否附带排行榜封面 PDF（rank_cover_pdf，默认关闭）"""
+        if comics and self.config.get("rank_cover_pdf", False):
+            await self._send_rank_cover_pdf(umo, comics, token, tt, event)
+
     @filter.command("picarank")
     async def rank_command(self, event: AstrMessageEvent, tt: str = "H24"):
         """排行榜：/picarank [H24|D7|D30]"""
@@ -806,18 +904,431 @@ class PicaPlugin(Star):
         if denied:
             yield event.plain_result(denied)
             return
-        tt = str(tt).strip().upper()
-        if tt not in ("H24", "D7", "D30"):
-            tt = "H24"
+        tt = self._parse_tt(tt) or "H24"
         try:
             yield event.plain_result("🏆 正在获取排行榜...")
             token = await self._auth_token(self._uid(event))
-            comics = await self.client.leaderboard(tt, token)
-            page_size = int(self.config.get("page_size", 10))
-            comics = comics[:page_size]
-            yield event.plain_result(MessageFormatter.format_rank(comics, tt))
+            comics, diff = await self._rank_payload(tt, token)
+            for text in self._rank_texts(tt, comics, diff):
+                yield event.plain_result(text)
+            await self._maybe_send_rank_cover_pdf(
+                event.unified_msg_origin, comics, token, tt, event
+            )
         except PicaError as e:
             yield event.plain_result(f"❌ 获取排行榜失败: {e}")
+
+    async def _notify(self, umo: str, text: str) -> None:
+        """尽力发送一条纯文本提示：失败只记日志，不影响调用方流程"""
+        chain: MessageChain | None = None
+        try:
+            chain = await self._build_notify_chain(umo, text)
+            await self.context.send_message(umo, chain)
+        except Exception as e:
+            if chain is not None and any(
+                isinstance(comp, Comp.Node) for comp in chain.chain
+            ):
+                # 折叠成长消息后失败 = 用户什么都收不到，值得告警
+                logger.warning(f"合并转发发送失败: {e}")
+            else:
+                logger.debug(f"发送提示消息失败: {e}")
+
+    @staticmethod
+    def _umo_platform_id(umo: str) -> str:
+        """从 unified_msg_origin 取平台 ID（形如 default:group:123456）"""
+        return str(umo).split(":", 1)[0]
+
+    def _forward_threshold(self, umo: str) -> int:
+        """该会话「超长文本折叠成合并转发」的字数阈值。
+
+        读取会话自己的 platform_settings.forward_threshold，
+        与管线里的 ResultDecorateStage 保持同一套配置。
+        """
+        raw = None
+        try:
+            conf = self.context.get_config(umo=umo) or {}
+            raw = (conf.get("platform_settings") or {}).get("forward_threshold")
+        except Exception as e:
+            logger.debug(f"读取 forward_threshold 失败，使用默认值: {e}")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_FORWARD_THRESHOLD
+
+    def _find_platform(self, platform_id: str):
+        """按平台 ID 找平台实例（取机器人自身账号用）"""
+        try:
+            platforms = self.context.platform_manager.platform_insts
+        except Exception as e:
+            logger.debug(f"获取平台实例失败: {e}")
+            return None
+        for platform in platforms:
+            try:
+                if str(platform.meta().id) == platform_id:
+                    return platform
+            except Exception:
+                continue
+        return None
+
+    async def _bot_identity(self, umo: str) -> tuple[str, str]:
+        """该会话所属平台机器人的 (QQ 号, 昵称)，带缓存。
+
+        合并转发节点需要注明「发送者」，而主动推送没有 event 可取 self_id，
+        只能向平台要。aiocqhttp 的 bot 通过 __getattr__ 动态暴露 OneBot API，
+        因此 bot.get_login_info() 等价于调用 get_login_info 接口。
+        任何一步失败都返回空串，由调用方退化成普通文本。
+        """
+        platform_id = self._umo_platform_id(umo)
+        cached = self._bot_accounts.get(platform_id)
+        if cached:
+            return cached
+
+        platform = self._find_platform(platform_id)
+        bot = getattr(platform, "bot", None) if platform is not None else None
+        if bot is None:
+            return "", ""
+        try:
+            info = await bot.get_login_info()
+        except Exception as e:
+            logger.warning(f"获取机器人账号信息失败，长消息将不折叠: {e}")
+            return "", ""
+
+        self_id = str((info or {}).get("user_id") or "")
+        nickname = str((info or {}).get("nickname") or "")
+        if not self_id:
+            return "", ""
+        self._bot_accounts[platform_id] = (self_id, nickname)
+        return self_id, nickname
+
+    async def _build_notify_chain(self, umo: str, text: str) -> MessageChain:
+        """构造主动推送的消息链：超长文本按响应管线的规则折叠成「合并转发」。
+
+        响应管线（ResultDecorateStage）只对**经过管线**的消息做这层处理：
+        aiocqhttp 平台下纯文本超过 forward_threshold 时，整条消息折叠成一个
+        Node（QQ 的「合并转发」）。主动推送走 context.send_message，绕过了
+        整条管线，超长纯文本在部分协议端会发送失败，因此这里复刻同样的规则，
+        阈值取该会话自己的平台配置。
+        """
+        threshold = self._forward_threshold(umo)
+        if len(text) <= threshold:
+            return MessageChain([Comp.Plain(text)])
+
+        self_id, nickname = await self._bot_identity(umo)
+        if not self_id:
+            logger.warning(
+                f"文本 {len(text)} 字超过 forward_threshold({threshold})，"
+                f"但取不到机器人账号，仍按普通文本发送（可能被平台拒收）"
+            )
+            return MessageChain([Comp.Plain(text)])
+
+        node = Comp.Node(
+            uin=self_id,
+            name=nickname or "AstrBot",
+            content=[Comp.Plain(text)],
+        )
+        return MessageChain([node])
+
+    async def _send_rank_cover_pdf(
+        self,
+        umo: str,
+        comics: list,
+        token: str,
+        tt: str,
+        event: AstrMessageEvent | None = None,
+    ) -> bool:
+        """下载排行榜全部封面、打包成 PDF 并发送（受 rank_cover_pdf 开关控制）。
+
+        这是排行榜文本之外的附加内容，因此尽力而为：任一步失败只提示用户，
+        不向上抛异常，避免影响排行榜本身。
+
+        Returns:
+            是否确认发送成功。
+        """
+        cover_dir: Path | None = None
+        try:
+            # 每次请求用独立临时目录：并发或重复调用时封面不会互相污染
+            cover_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f"rank_{tt}_", dir=self.downloader.cache_dir()
+                )
+            )
+
+            await self._notify(
+                umo, f"🖼️ 正在下载排行榜 {len(comics)} 张封面并生成 PDF..."
+            )
+            covers = await self.downloader.download_covers(
+                comics,
+                token=token,
+                max_concurrent=int(self.config.get("max_concurrent", 5)),
+                target_dir=cover_dir,
+            )
+            if not covers:
+                await self._notify(umo, "❌ 排行榜封面下载失败，未获取到任何封面")
+                return False
+
+            packer = PicaPacker("pdf")
+            safe_name = self._safe_filename(f"排行榜封面_{tt}")
+            packs_dir = self.data_dir / PACKS_DIR
+            # 打包是 CPU/IO 密集操作，丢到线程池避免阻塞事件循环
+            result = await asyncio.to_thread(
+                packer.pack, cover_dir, safe_name, packs_dir
+            )
+            if not result.success or not result.output_path:
+                await self._notify(umo, f"❌ 封面 PDF 生成失败: {result.error_message}")
+                return False
+
+            out_path = result.output_path
+            rank_name = RANK_TYPES.get(tt, tt)
+            chain = MessageChain(
+                [
+                    Comp.File(name=out_path.name, file=str(out_path)),
+                    Comp.Plain(f"🖼️ 排行榜封面 {len(covers)} 张 ({rank_name})"),
+                ]
+            )
+            send_result = await self._send_with_retry(event, umo, chain)
+            if send_result is True:
+                return True
+            if send_result is None:
+                # 上传超时：文件很可能已送达，不再重发，也不谎报失败
+                await self._notify(
+                    umo,
+                    f"⚠️ 封面 PDF 上传超时，无法确认是否已送达，请先确认是否收到；"
+                    f"本地文件: {out_path}",
+                )
+                return False
+            await self._notify(umo, f"⚠️ 封面 PDF 发送失败，已保存在本地: {out_path}")
+            return False
+        except Exception as e:
+            logger.error(f"排行榜封面 PDF 处理异常: {e}")
+            await self._notify(umo, f"⚠️ 排行榜封面 PDF 处理失败: {e}")
+            return False
+        finally:
+            # 封面只是 PDF 的中间产物，打包完即可清理
+            if cover_dir is not None:
+                shutil.rmtree(cover_dir, ignore_errors=True)
+
+    # ---------- 排行榜订阅（定时推送） ----------
+
+    def _cron_expr(self, tt: str) -> str:
+        """该榜单类型的刷新时间（cron 表达式，空串表示不推送）"""
+        return str(self.config.get(f"rank_cron_{tt.lower()}", "") or "").strip()
+
+    def _sub_status_text(self, umo: str) -> str:
+        """订阅状态文本（list 与订阅成功回复共用）"""
+        targets = self.subs.targets(umo)
+        lines = ["📋 本群排行榜订阅", "━━━━━━━━━━━━━━━━━━━"]
+        for tt, name in RANK_TYPES.items():
+            if tt not in targets:
+                lines.append(f"➖ {name}")
+                continue
+            expr = self._cron_expr(tt)
+            if not expr:
+                schedule = "⚠️ 未配置刷新时间"
+            elif validate_cron(expr):
+                schedule = f"⚠️ 刷新时间非法: {expr}"
+            else:
+                schedule = f"⏰ {expr}"
+            lines.append(f"✅ {name} {schedule}")
+        lines.append("━━━━━━━━━━━━━━━━━━━")
+        lines.append("💡 /picasub <H24|D7|D30> 添加 | /picasub off 取消全部")
+        return "\n".join(lines)
+
+    @filter.command("picasub")
+    async def subscribe_command(self, event: AstrMessageEvent, arg: str = None):
+        """排行榜定时推送订阅：/picasub [H24|D7|D30] | list | off"""
+        denied = self._guard(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+        umo = event.unified_msg_origin
+        value = str(arg or "").strip()
+        keyword = value.lower()
+
+        if keyword in ("list", "ls", "status"):
+            yield event.plain_result(self._sub_status_text(umo))
+            return
+
+        if keyword in ("off", "del", "unsub"):
+            removed = self.subs.remove(umo)
+            if not removed:
+                yield event.plain_result("📭 本群当前没有排行榜订阅")
+            else:
+                names = "、".join(RANK_TYPES.get(tt, tt) for tt in removed)
+                yield event.plain_result(f"🗑️ 已取消本群的排行榜订阅：{names}")
+            return
+
+        # 与 /picarank 一致：参数非法时回落到日榜
+        tt = self._parse_tt(value) or "H24"
+        name = RANK_TYPES[tt]
+        added = self.subs.add(umo, tt, self._uid(event))
+        head = (
+            f"✅ 已为本群订阅「{name}」排行榜"
+            if added
+            else f"ℹ️ 本群早已订阅「{name}」排行榜"
+        )
+
+        expr = self._cron_expr(tt)
+        if not expr:
+            tip = f"⚠️ 未配置刷新时间（rank_cron_{tt.lower()}），订阅后不会推送"
+        else:
+            err = validate_cron(expr)
+            if err:
+                tip = f"⚠️ 刷新时间配置有误（{expr}）：{err}"
+            else:
+                tip = f"⏰ 定时推送: {expr}"
+        yield event.plain_result(f"{head}\n{tip}\n\n{self._sub_status_text(umo)}")
+
+    def _debug_guard(self, event: AstrMessageEvent) -> str | None:
+        """调试命令权限：必须配置在 admin_ids 中。
+
+        `/picadebug` 会立刻向所有订阅会话推送，等于一次全量广播，
+        因此即使没开 admin_only，也只允许 admin_ids 里的用户使用。
+        """
+        denied = self._guard(event)
+        if denied:
+            return denied
+        admin_ids = self._admin_ids()
+        if not admin_ids:
+            return (
+                "❌ 调试命令需要先在插件配置里填写 admin_ids"
+                "（逗号分隔的 QQ 号）才能使用"
+            )
+        if self._uid(event) not in admin_ids:
+            return "❌ 你没有权限使用调试命令"
+        return None
+
+    async def _trigger_subscriptions(self, targets: list[str]) -> tuple[int, list[str]]:
+        """无视时间触发订阅推送，返回 (推送会话数, 每个榜单的结果说明)"""
+        sent = 0
+        notes: list[str] = []
+        for tt in targets:
+            name = RANK_TYPES.get(tt, tt)
+            groups = self.subs.groups_for(tt)
+            if not groups:
+                notes.append(f"➖ {name}: 无人订阅")
+                continue
+            count = await self._push_rank_to_groups(tt, groups)
+            sent += count
+            if count:
+                notes.append(f"✅ {name}: 已推送给 {count} 个会话")
+            else:
+                notes.append(f"⚠️ {name}: {len(groups)} 个订阅会话推送失败（请看日志）")
+        return sent, notes
+
+    @filter.command("picadebug")
+    async def debug_command(self, event: AstrMessageEvent, arg: str = None):
+        """调试：无视 cron 时间立即触发订阅推送：/picadebug [H24|D7|D30|all]"""
+        denied = self._debug_guard(event)
+        if denied:
+            yield event.plain_result(denied)
+            return
+
+        value = str(arg or "").strip()
+        if value.lower() in ("", "all", "*", "全部"):
+            targets = list(RANK_TYPES)
+        else:
+            tt = self._parse_tt(value)
+            if tt is None:
+                yield event.plain_result(
+                    "❌ 用法: /picadebug [H24|D7|D30|all]\n"
+                    "调试用：无视 rank_cron_* 的时间设置，立即触发一次订阅推送"
+                )
+                return
+            targets = [tt]
+
+        yield event.plain_result(
+            "🔧 调试触发订阅推送（无视时间）: "
+            + "、".join(RANK_TYPES.get(tt, tt) for tt in targets)
+        )
+        sent, notes = await self._trigger_subscriptions(targets)
+        yield event.plain_result(
+            "\n".join(
+                [
+                    "🔧 触发完成",
+                    "━━━━━━━━━━━━━━━━━━━",
+                    *notes,
+                    "━━━━━━━━━━━━━━━━━━━",
+                    f"共推送 {sent} 个会话",
+                    "💡 本次榜单已写入快照，随后的定时推送不会重复提醒新上榜",
+                ]
+            )
+        )
+
+    async def _rank_sub_loop(self) -> None:
+        """按配置的 cron 定时推送排行榜（每 RANK_SUB_TICK_SEC 秒检查一次）"""
+        while True:
+            await asyncio.sleep(RANK_SUB_TICK_SEC)
+            try:
+                await self._run_rank_subscriptions(datetime.now())
+            except Exception as e:
+                logger.warning(f"排行榜定时推送失败: {e}")
+
+    async def _run_rank_subscriptions(self, now: datetime) -> int:
+        """到点的榜单类型向订阅会话推送，返回本次推送的会话数（便于测试）"""
+        stamp = now.strftime("%Y-%m-%d %H:%M")
+        pushed = 0
+        for tt in RANK_TYPES:
+            expr = self._cron_expr(tt)
+            if not expr:
+                continue
+            err = validate_cron(expr)
+            if err:
+                if self._cron_warned.get(tt) != expr:
+                    self._cron_warned[tt] = expr
+                    logger.warning(
+                        f"rank_cron_{tt.lower()} 不是合法的 cron 表达式，已忽略: {err}"
+                    )
+                continue
+            if not cron_matches(expr, now):
+                continue
+            if self._rank_fired.get(tt) == stamp:
+                continue  # 同一分钟只触发一次
+            groups = self.subs.groups_for(tt)
+            if not groups:
+                continue
+            self._rank_fired[tt] = stamp
+            pushed += await self._push_rank_to_groups(tt, groups)
+        return pushed
+
+    async def _push_rank_to_groups(self, tt: str, groups: list[str]) -> int:
+        """抓取一次榜单并推送给全部订阅会话（返回成功推送的会话数）"""
+        identity = await self._subscription_identity(groups)
+        if identity is None:
+            return 0
+        token, user_id = identity
+        self.client.set_current_user(user_id)
+        try:
+            comics, diff = await self._rank_payload(tt, token)
+        except Exception as e:
+            logger.warning(f"定时推送 {tt} 排行榜失败: {e}")
+            return 0
+
+        sent = 0
+        for umo in groups:
+            try:
+                for text in self._rank_texts(tt, comics, diff):
+                    await self._notify(umo, text)
+                await self._maybe_send_rank_cover_pdf(umo, comics, token, tt)
+                sent += 1
+            except Exception as e:
+                logger.warning(f"向 {umo} 推送 {tt} 排行榜失败: {e}")
+        logger.info(f"排行榜定时推送完成: {tt} → {sent} 个会话")
+        return sent
+
+    async def _subscription_identity(self, groups: list[str]) -> tuple[str, str] | None:
+        """定时推送用的账号：优先订阅者自己绑定的账号，其次配置的默认账号"""
+        for umo in groups:
+            owner = self.subs.owner_of(umo)
+            if not owner:
+                continue
+            try:
+                return await self.auth.ensure_login(owner), owner
+            except PicaError:
+                continue
+        try:
+            return await self.auth.ensure_default_login(), "__default__"
+        except PicaError as e:
+            logger.warning(f"排行榜定时推送缺少可用账号，本次跳过: {e}")
+            return None
 
     # ---------- 分区浏览 ----------
 

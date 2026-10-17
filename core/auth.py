@@ -201,19 +201,26 @@ class PicaAuthManager:
 
         # 2. 默认账号兜底
         if self.allow_default_account and self.default_email and self.default_password:
-            default_token = self._read_token(self._default_token_file)
-            if default_token:
-                return default_token[0]
-            # 登录默认账号并持久化
-            token = await self.client.login(self.default_email, self.default_password)
-            self._save_token(self._default_token_file, token)
-            return token
+            return await self.ensure_default_login()
 
         # 3. 无可用账号
         raise PicaError(
             "你的 QQ 还未绑定哔咔账号，为避免共用他人账号，请先发送 "
             "「/picalogin <邮箱> <密码>」绑定自己的哔咔账号"
         )
+
+    async def ensure_default_login(self) -> str:
+        """确保拿到配置默认账号的 token（定时推送等「没有具体用户」的场景用）"""
+        if not self.default_email or not self.default_password:
+            raise PicaError(
+                "插件配置中未填写默认账号（pica_account/pica_password），无法完成该操作"
+            )
+        default_token = self._read_token(self._default_token_file)
+        if default_token:
+            return default_token[0]
+        token = await self.client.login(self.default_email, self.default_password)
+        self._save_token(self._default_token_file, token)
+        return token
 
     async def force_relogin(self, user_id: str) -> str:
         """
@@ -237,8 +244,7 @@ class PicaAuthManager:
         # 2. 默认账号
         self.logout_default()
         if self.default_email and self.default_password:
-            token = await self.client.login(self.default_email, self.default_password)
-            self._save_token(self._default_token_file, token)
+            token = await self.ensure_default_login()
             logger.info("默认哔咔账号 token 失效，已自动重新登录")
             return token
 
